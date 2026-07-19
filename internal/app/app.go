@@ -35,6 +35,7 @@ var (
 	updateCheckFiltered       = update.CheckFiltered
 	upgradeExecute            = upgrade.Execute
 	upgradeExecuteWithOptions = upgrade.ExecuteWithOptions
+	upgradeUserHomeDir        = os.UserHomeDir
 	selfUpdateFn              = selfUpdate
 	ensureCurrentOSSupported  = system.EnsureCurrentOSSupported
 	detectSystem              = system.Detect
@@ -442,19 +443,29 @@ func runUpgrade(ctx context.Context, args []string, detection system.DetectionRe
 	dryRun := false
 	noBackup := false
 	var toolFilter []string
+	afterDelimiter := false
 
 	for _, arg := range args {
+		if afterDelimiter {
+			toolFilter = append(toolFilter, arg)
+			continue
+		}
+
 		switch {
+		case arg == "--":
+			afterDelimiter = true
 		case arg == "--dry-run" || arg == "-n":
 			dryRun = true
 		case arg == "--no-backup":
 			noBackup = true
-		case !strings.HasPrefix(arg, "-"):
+		case strings.HasPrefix(arg, "-"):
+			return fmt.Errorf("unknown upgrade flag %q", arg)
+		default:
 			toolFilter = append(toolFilter, arg)
 		}
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := upgradeUserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolve home directory: %w", err)
 	}

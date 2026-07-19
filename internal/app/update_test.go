@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -94,6 +95,112 @@ func TestRunUpgrade_ReturnsErrorBeforeExecutingWhenChecksFail(t *testing.T) {
 	if strings.Contains(out, "Upgrade\n") {
 		t.Fatalf("runUpgrade() should stop before rendering upgrade report:\n%s", out)
 	}
+}
+
+func TestRunUpgrade_RejectsUnknownFlagsBeforeSideEffects(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		arg  string
+	}{
+		{name: "long flag", arg: "--bad-flag"},
+		{name: "short flag", arg: "-x"},
+		{name: "single dash", arg: "-legacy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			origHomeDir := upgradeUserHomeDir
+			origCheckFiltered := updateCheckFiltered
+			origExecuteWithOptions := upgradeExecuteWithOptions
+			t.Cleanup(func() {
+				upgradeUserHomeDir = origHomeDir
+				updateCheckFiltered = origCheckFiltered
+				upgradeExecuteWithOptions = origExecuteWithOptions
+			})
+
+			homeCalls := 0
+			checkCalls := 0
+			executeCalls := 0
+			upgradeUserHomeDir = func() (string, error) {
+				homeCalls++
+				return t.TempDir(), nil
+			}
+			updateCheckFiltered = func(context.Context, string, system.PlatformProfile, []string) []update.UpdateResult {
+				checkCalls++
+				return nil
+			}
+			upgradeExecuteWithOptions = func(context.Context, []update.UpdateResult, system.PlatformProfile, string, bool, upgrade.ExecuteOptions) upgrade.UpgradeReport {
+				executeCalls++
+				return upgrade.UpgradeReport{}
+			}
+
+			var stdout bytes.Buffer
+			err := runUpgrade(context.Background(), []string{tt.arg}, supportedUpgradeDetection(), &stdout)
+			if err == nil || !strings.Contains(err.Error(), tt.arg) {
+				t.Fatalf("runUpgrade() error = %v, want error identifying %q", err, tt.arg)
+			}
+			if homeCalls != 0 || checkCalls != 0 || executeCalls != 0 {
+				t.Fatalf("runUpgrade() side effects: home=%d check=%d execute=%d, want all zero", homeCalls, checkCalls, executeCalls)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("runUpgrade() output = %q, want empty", stdout.String())
+			}
+		})
+	}
+}
+
+func TestRunUpgrade_PreservesSupportedFlagsAndFilters(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		args       []string
+		wantDryRun bool
+		wantNoBack bool
+		wantFilter []string
+	}{
+		{name: "dry run", args: []string{"--dry-run"}, wantDryRun: true},
+		{name: "short dry run", args: []string{"-n"}, wantDryRun: true},
+		{name: "no backup", args: []string{"--no-backup"}, wantNoBack: true},
+		{name: "flag combination", args: []string{"--dry-run", "--no-backup", "typo"}, wantDryRun: true, wantNoBack: true, wantFilter: []string{"typo"}},
+		{name: "positional filter", args: []string{"typo"}, wantFilter: []string{"typo"}},
+		{name: "dash prefixed filter after delimiter", args: []string{"--", "--legacy-tool"}, wantFilter: []string{"--legacy-tool"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			origHomeDir := upgradeUserHomeDir
+			origCheckFiltered := updateCheckFiltered
+			origExecuteWithOptions := upgradeExecuteWithOptions
+			t.Cleanup(func() {
+				upgradeUserHomeDir = origHomeDir
+				updateCheckFiltered = origCheckFiltered
+				upgradeExecuteWithOptions = origExecuteWithOptions
+			})
+
+			upgradeUserHomeDir = func() (string, error) { return t.TempDir(), nil }
+			var gotFilter []string
+			updateCheckFiltered = func(_ context.Context, _ string, _ system.PlatformProfile, toolFilter []string) []update.UpdateResult {
+				gotFilter = append([]string(nil), toolFilter...)
+				return nil
+			}
+			gotDryRun := false
+			gotNoBack := false
+			upgradeExecuteWithOptions = func(_ context.Context, _ []update.UpdateResult, _ system.PlatformProfile, _ string, dryRun bool, options upgrade.ExecuteOptions) upgrade.UpgradeReport {
+				gotDryRun = dryRun
+				gotNoBack = options.SkipBackup
+				return upgrade.UpgradeReport{DryRun: dryRun}
+			}
+
+			if err := runUpgrade(context.Background(), tt.args, supportedUpgradeDetection(), io.Discard); err != nil {
+				t.Fatalf("runUpgrade() error = %v", err)
+			}
+			if gotDryRun != tt.wantDryRun || gotNoBack != tt.wantNoBack {
+				t.Fatalf("runUpgrade() options = dryRun:%t noBackup:%t, want dryRun:%t noBackup:%t", gotDryRun, gotNoBack, tt.wantDryRun, tt.wantNoBack)
+			}
+			if !reflect.DeepEqual(gotFilter, tt.wantFilter) {
+				t.Fatalf("runUpgrade() filter = %#v, want %#v", gotFilter, tt.wantFilter)
+			}
+		})
+	}
+}
+
+func supportedUpgradeDetection() system.DetectionResult {
+	return system.DetectionResult{System: system.SystemInfo{Profile: system.PlatformProfile{OS: "darwin", PackageManager: "brew", Supported: true}}}
 }
 
 // TestRunUpgrade_RestartsAfterGentleAIUpgrade verifies that `gentle-ai upgrade`
