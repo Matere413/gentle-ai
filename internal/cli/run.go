@@ -461,6 +461,11 @@ type installRuntime struct {
 	channel      InstallChannel
 	backupRoot   string
 	state        *runtimeState
+	// progress is the optional per-step command-progress callback threaded
+	// into every agentInstallStep. Non-TUI flows leave it nil; the TUI sets it
+	// via newInstallRuntimeWithProgress so each multi-command agent step can
+	// emit live START/SUCCEEDED/FAILED events.
+	progress pipeline.ProgressFunc
 }
 
 type runtimeState struct {
@@ -499,6 +504,19 @@ func newInstallRuntime(homeDir string, scope InstallScope, channel InstallChanne
 	}, nil
 }
 
+// newInstallRuntimeWithProgress is the TUI entry point: it builds the same
+// runtime as newInstallRuntime and threads the per-step command-progress
+// callback into every agentInstallStep. Non-TUI callers keep using
+// newInstallRuntime so their progress stays nil.
+func newInstallRuntimeWithProgress(homeDir string, scope InstallScope, channel InstallChannel, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, progress pipeline.ProgressFunc) (*installRuntime, error) {
+	rt, err := newInstallRuntime(homeDir, scope, channel, selection, resolved, profile)
+	if err != nil {
+		return nil, err
+	}
+	rt.progress = progress
+	return rt, nil
+}
+
 func (r *installRuntime) stagePlan() pipeline.StagePlan {
 	targets := backupTargets(r.homeDir, r.workspaceDir, r.scope, r.selection, r.resolved)
 	prepare := []pipeline.Step{
@@ -529,7 +547,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 
 	for _, agent := range r.resolved.Agents {
 
-		apply = append(apply, agentInstallStep{id: "agent:" + string(agent), agent: agent, homeDir: r.homeDir, profile: r.profile})
+		apply = append(apply, agentInstallStep{id: "agent:" + string(agent), agent: agent, homeDir: r.homeDir, profile: r.profile, progress: r.progress})
 	}
 
 	if containsAgent(r.resolved.Agents, model.AgentOpenCode) {
@@ -690,10 +708,11 @@ func (s rollbackRestoreStep) Rollback() error {
 }
 
 type agentInstallStep struct {
-	id      string
-	agent   model.AgentID
-	homeDir string
-	profile system.PlatformProfile
+	id       string
+	agent    model.AgentID
+	homeDir  string
+	profile  system.PlatformProfile
+	progress pipeline.ProgressFunc
 }
 
 type openCodePluginInstallStep struct {
@@ -1247,7 +1266,7 @@ func BuildRealStagePlan(homeDir string, scope InstallScope, selection model.Sele
 // ExecuteTUIInstall runs the same install runtime as the CLI and carries
 // non-fatal Pi CodeGraph manual actions into the TUI completion result.
 func ExecuteTUIInstall(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, onProgress pipeline.ProgressFunc) pipeline.ExecutionResult {
-	runtime, err := newInstallRuntime(homeDir, ScopeGlobal, ChannelStable, selection, resolved, profile)
+	runtime, err := newInstallRuntimeWithProgress(homeDir, ScopeGlobal, ChannelStable, selection, resolved, profile, onProgress)
 	if err != nil {
 		return pipeline.ExecutionResult{Err: err}
 	}
@@ -1319,6 +1338,87 @@ func ggaAvailable(profile system.PlatformProfile) bool {
 		if _, err := osStat(filepath.Join(homeDir, "bin", "gga")); err == nil {
 			return true
 		}
+	}
+	return false
+}
+
+// piKnownInstallPackages is the exact allowlist of `pi install npm:<pkg>`
+// triples whose package spec is safe to surface as a progress display label.
+// These are compile-time literals derived from the Pi adapter's known install
+// command set. Any other argv — including engram-init, unknown pi targets,
+// URLs, paths, or tokens — MUST use the bounded fallback and never reach the
+// TUI as raw argv.
+var piKnownInstallPackages = map[string]struct{}{
+	"npm:gentle-pi":                          {},
+	"npm:gentle-engram":                      {},
+	"npm:pi-mcp-adapter":                     {},
+	"npm:pi-subagents-j0k3r":                 {},
+	"npm:@juicesharp/rpiv-ask-user-question": {},
+	"npm:pi-web-access":                      {},
+	"npm:@juicesharp/rpiv-todo":              {},
+	"npm:pi-btw":                             {},
+}
+
+// progressLabel is the bounded display label type returned by
+// safeInstallDisplayName. It is the only string the command-progress
+// transport ever carries as a user-facing name.
+type progressLabel string
+
+// safeInstallDisplayName returns a bounded, safe display label for a single
+// command in a multi-command agent install step. For PI it exact-matches the
+// known `pi install npm:<known-package>` triples and returns the static
+// package literal; for everything else (engram-init, unknown PI targets,
+// non-PI agents, arbitrary argv) it returns the bounded fallback
+// "<agent> command <k>". It NEVER derives, joins, slices, logs, or exposes
+// raw argv, URLs, tokens, paths, or environment values. The second return
+// value reports whether the label is a known PI package literal.
+//
+// k is the 1-indexed command position within the step; it is used only for the
+// fallback label so the UI can show a bounded counter without revealing argv.
+func safeInstallDisplayName(agent model.AgentID, argv []string, k int) (progressLabel, bool) {
+	if k < 1 {
+		k = 1
+	}
+	agentID := string(agent)
+	if agent == model.AgentPi && len(argv) == 3 &&
+		argv[0] == "pi" && argv[1] == "install" {
+		if _, ok := piKnownInstallPackages[argv[2]]; ok {
+			return progressLabel(argv[2]), true
+		}
+	}
+	// engram-init fallback: detect the known engram-init invocation shape and
+	// surface a stable, bounded label instead of the raw npm/pnpm argv.
+	if agent == model.AgentPi && isEngramInitCommand(argv) {
+		return progressLabel(agentID + " command engram-init"), false
+	}
+	return progressLabel(fmt.Sprintf("%s command %d", agentID, k)), false
+}
+
+// isEngramInitCommand recognizes PI's known engram-init invocation shapes
+// (pnpm dlx gentle-engram@latest pi-engram init, or
+// npm exec --yes --package gentle-engram@latest -- pi-engram init) without
+// exposing any argv. It is intentionally strict: only these two exact shapes
+// match.
+func isEngramInitCommand(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	switch argv[0] {
+	case "pnpm":
+		return len(argv) == 5 &&
+			argv[1] == "dlx" &&
+			argv[2] == "gentle-engram@latest" &&
+			argv[3] == "pi-engram" &&
+			argv[4] == "init"
+	case "npm":
+		return len(argv) == 8 &&
+			argv[1] == "exec" &&
+			argv[2] == "--yes" &&
+			argv[3] == "--package" &&
+			argv[4] == "gentle-engram@latest" &&
+			argv[5] == "--" &&
+			argv[6] == "pi-engram" &&
+			argv[7] == "init"
 	}
 	return false
 }

@@ -304,6 +304,91 @@ func TestOrchestratorWithProgressFunc(t *testing.T) {
 	if events[2].Stage != StageApply || events[2].StepID != "act" {
 		t.Fatalf("event[2] = %+v", events[2])
 	}
+
+	// The typed command-progress payload MUST NOT alter the existing fields
+	// when it is absent: every event in this run has a zero Command field and
+	// the legacy StepID/Stage/Status/Err values are preserved exactly.
+	for i, e := range events {
+		if e.Command != nil {
+			t.Fatalf("event[%d].Command = %+v, want nil when no command payload is carried", i, e.Command)
+		}
+		if e.StepID == "" || e.Stage == "" || e.Status == "" {
+			t.Fatalf("event[%d] lost a legacy field: %+v", i, e)
+		}
+	}
+}
+
+// TestCommandProgressEventRoundTripsThroughProgressFunc proves the typed
+// command-progress payload survives a ProgressFunc round-trip with its
+// StepID/AgentID/DisplayName/Current/Total/Status fields intact and the
+// existing StepID/Stage/Status fields on the enclosing ProgressEvent are
+// untouched. Also covers the three terminal lifecycle constants by using
+// each one in the assertions.
+func TestCommandProgressEventRoundTripsThroughProgressFunc(t *testing.T) {
+	statuses := []CommandProgressStatus{
+		CommandProgressStarted,
+		CommandProgressSucceeded,
+		CommandProgressFailed,
+	}
+	seen := map[CommandProgressStatus]bool{}
+	for _, s := range statuses {
+		if s == "" {
+			t.Fatalf("CommandProgressStatus constant is empty")
+		}
+		if seen[s] {
+			t.Fatalf("duplicate CommandProgressStatus constant %q", s)
+		}
+		seen[s] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 distinct command progress statuses, got %d", len(seen))
+	}
+
+	captured := []ProgressEvent{}
+	orchestrator := NewOrchestrator(
+		DefaultRollbackPolicy(),
+		WithProgressFunc(func(e ProgressEvent) {
+			captured = append(captured, e)
+		}),
+	)
+
+	// A synthetic event carrying the typed payload round-trips through the
+	// ProgressFunc with all legacy and command fields preserved.
+	orchestrator.runner.OnProgress(ProgressEvent{
+		StepID: "agent:pi",
+		Stage:  StageApply,
+		Status: StepStatusRunning,
+		Command: &CommandProgressEvent{
+			StepID:      "agent:pi",
+			AgentID:     "pi",
+			DisplayName: "npm:gentle-pi",
+			Current:     1,
+			Total:       9,
+			Status:      CommandProgressStarted,
+		},
+	})
+
+	if len(captured) != 1 {
+		t.Fatalf("captured = %d events, want 1", len(captured))
+	}
+	got := captured[0]
+	if got.StepID != "agent:pi" || got.Stage != StageApply || got.Status != StepStatusRunning {
+		t.Fatalf("legacy fields changed: %+v", got)
+	}
+	if got.Command == nil {
+		t.Fatalf("Command payload dropped on round-trip")
+	}
+	want := CommandProgressEvent{
+		StepID:      "agent:pi",
+		AgentID:     "pi",
+		DisplayName: "npm:gentle-pi",
+		Current:     1,
+		Total:       9,
+		Status:      CommandProgressStarted,
+	}
+	if !reflect.DeepEqual(*got.Command, want) {
+		t.Fatalf("Command round-trip = %+v, want %+v", *got.Command, want)
+	}
 }
 
 type testStep struct {
