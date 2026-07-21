@@ -2526,3 +2526,285 @@ func TestAgentInstallStepThreadsProgressCallback(t *testing.T) {
 		}
 	})
 }
+
+// TestRunCommandSequenceWithProgressEventOrder proves the executor boundary
+// emits exactly 2N events for an all-success sequence, exactly 2k events for a
+// failure at command k (k<=N), and never runs commands after the failure.
+// It also proves the terminal event for command k is FAILED, not SUCCEEDED,
+// and that DisplayName comes from safeInstallDisplayName.
+func TestRunCommandSequenceWithProgressEventOrder(t *testing.T) {
+	restoreCommand := runCommand
+	t.Cleanup(func() { runCommand = restoreCommand })
+
+	type want struct {
+		status  pipeline.CommandProgressStatus
+		current int
+		total   int
+		display string
+	}
+	cases := []struct {
+		name     string
+		commands [][]string
+		agent    model.AgentID
+		failAt   int // 0 = no failure
+		wantSeq  []want
+		wantRuns int // number of runCommand invocations expected
+	}{
+		{
+			name:     "N=3 all success emits 6 ordered boundary events",
+			agent:    model.AgentPi,
+			commands: [][]string{{"pi", "install", "npm:gentle-pi"}, {"pi", "install", "npm:gentle-engram"}, {"pi", "install", "npm:pi-mcp-adapter"}},
+			failAt:   0,
+			wantSeq: []want{
+				{pipeline.CommandProgressStarted, 1, 3, "npm:gentle-pi"},
+				{pipeline.CommandProgressSucceeded, 1, 3, "npm:gentle-pi"},
+				{pipeline.CommandProgressStarted, 2, 3, "npm:gentle-engram"},
+				{pipeline.CommandProgressSucceeded, 2, 3, "npm:gentle-engram"},
+				{pipeline.CommandProgressStarted, 3, 3, "npm:pi-mcp-adapter"},
+				{pipeline.CommandProgressSucceeded, 3, 3, "npm:pi-mcp-adapter"},
+			},
+			wantRuns: 3,
+		},
+		{
+			name:     "N=5 fail at k=3 emits 6 events and halts",
+			agent:    model.AgentPi,
+			commands: [][]string{{"pi", "install", "npm:gentle-pi"}, {"pi", "install", "npm:gentle-engram"}, {"pi", "install", "npm:pi-mcp-adapter"}, {"pi", "install", "npm:pi-web-access"}, {"pi", "install", "npm:pi-btw"}},
+			failAt:   3,
+			wantSeq: []want{
+				{pipeline.CommandProgressStarted, 1, 5, "npm:gentle-pi"},
+				{pipeline.CommandProgressSucceeded, 1, 5, "npm:gentle-pi"},
+				{pipeline.CommandProgressStarted, 2, 5, "npm:gentle-engram"},
+				{pipeline.CommandProgressSucceeded, 2, 5, "npm:gentle-engram"},
+				{pipeline.CommandProgressStarted, 3, 5, "npm:pi-mcp-adapter"},
+				{pipeline.CommandProgressFailed, 3, 5, "npm:pi-mcp-adapter"},
+			},
+			wantRuns: 3,
+		},
+		{
+			name:     "N=4 fail on last command emits 2N events ending in FAILED",
+			agent:    model.AgentPi,
+			commands: [][]string{{"pi", "install", "npm:gentle-pi"}, {"pi", "install", "npm:gentle-engram"}, {"pi", "install", "npm:pi-mcp-adapter"}, {"pi", "install", "npm:pi-btw"}},
+			failAt:   4,
+			wantSeq: []want{
+				{pipeline.CommandProgressStarted, 1, 4, "npm:gentle-pi"},
+				{pipeline.CommandProgressSucceeded, 1, 4, "npm:gentle-pi"},
+				{pipeline.CommandProgressStarted, 2, 4, "npm:gentle-engram"},
+				{pipeline.CommandProgressSucceeded, 2, 4, "npm:gentle-engram"},
+				{pipeline.CommandProgressStarted, 3, 4, "npm:pi-mcp-adapter"},
+				{pipeline.CommandProgressSucceeded, 3, 4, "npm:pi-mcp-adapter"},
+				{pipeline.CommandProgressStarted, 4, 4, "npm:pi-btw"},
+				{pipeline.CommandProgressFailed, 4, 4, "npm:pi-btw"},
+			},
+			wantRuns: 4,
+		},
+		{
+			name:     "non-PI agent uses bounded fallback display label",
+			agent:    model.AgentCodex,
+			commands: [][]string{{"npm", "install", "-g", "@openai/codex"}, {"npm", "install", "-g", "@openai/codex-cli"}},
+			failAt:   0,
+			wantSeq: []want{
+				{pipeline.CommandProgressStarted, 1, 2, "codex command 1"},
+				{pipeline.CommandProgressSucceeded, 1, 2, "codex command 1"},
+				{pipeline.CommandProgressStarted, 2, 2, "codex command 2"},
+				{pipeline.CommandProgressSucceeded, 2, 2, "codex command 2"},
+			},
+			wantRuns: 2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runs := 0
+			runCommand = func(name string, args ...string) error {
+				runs++
+				if tc.failAt > 0 && runs == tc.failAt {
+					return fmt.Errorf("simulated failure at command %d", tc.failAt)
+				}
+				return nil
+			}
+
+			var got []pipeline.ProgressEvent
+			cb := func(e pipeline.ProgressEvent) {
+				got = append(got, e)
+			}
+
+			err := runCommandSequenceWithProgress(tc.agent, "agent:test", tc.commands, cb)
+
+			if tc.failAt > 0 {
+				if err == nil {
+					t.Fatalf("expected error for failAt=%d, got nil", tc.failAt)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+
+			if runs != tc.wantRuns {
+				t.Fatalf("runCommand invocations = %d, want %d (fail-fast must halt remaining commands)", runs, tc.wantRuns)
+			}
+
+			if len(got) != len(tc.wantSeq) {
+				t.Fatalf("event count = %d, want %d; events: %+v", len(got), len(tc.wantSeq), got)
+			}
+
+			for i, w := range tc.wantSeq {
+				ev := got[i]
+				if ev.Command == nil {
+					t.Fatalf("event %d: Command payload is nil", i)
+				}
+				if ev.Command.Status != w.status {
+					t.Fatalf("event %d status = %q, want %q", i, ev.Command.Status, w.status)
+				}
+				if ev.Command.Current != w.current {
+					t.Fatalf("event %d current = %d, want %d", i, ev.Command.Current, w.current)
+				}
+				if ev.Command.Total != w.total {
+					t.Fatalf("event %d total = %d, want %d", i, ev.Command.Total, w.total)
+				}
+				if ev.Command.DisplayName != w.display {
+					t.Fatalf("event %d display = %q, want %q", i, ev.Command.DisplayName, w.display)
+				}
+				if ev.Command.AgentID != string(tc.agent) {
+					t.Fatalf("event %d agentID = %q, want %q", i, ev.Command.AgentID, string(tc.agent))
+				}
+				if ev.Command.StepID != "agent:test" {
+					t.Fatalf("event %d stepID = %q, want %q", i, ev.Command.StepID, "agent:test")
+				}
+			}
+		})
+	}
+}
+
+// TestRunCommandSequenceWithProgressEmptySequence proves the wrapper preserves
+// the existing empty-sequence error behavior and emits no events.
+func TestRunCommandSequenceWithProgressEmptySequence(t *testing.T) {
+	restoreCommand := runCommand
+	t.Cleanup(func() { runCommand = restoreCommand })
+	runCommand = func(string, ...string) error { return nil }
+
+	var got []pipeline.ProgressEvent
+	cb := func(e pipeline.ProgressEvent) { got = append(got, e) }
+
+	if err := runCommandSequenceWithProgress(model.AgentPi, "agent:test", nil, cb); err == nil {
+		t.Fatalf("expected error for empty sequence, got nil")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 events for empty sequence, got %d", len(got))
+	}
+}
+
+// TestRunCommandSequenceWithProgressNilCallback proves a nil callback is a
+// no-op so non-TUI callers that thread nil progress never panic.
+func TestRunCommandSequenceWithProgressNilCallback(t *testing.T) {
+	restoreCommand := runCommand
+	t.Cleanup(func() { runCommand = restoreCommand })
+	runCommand = func(string, ...string) error { return nil }
+
+	if err := runCommandSequenceWithProgress(model.AgentPi, "agent:test", [][]string{{"pi", "install", "npm:gentle-pi"}}, nil); err != nil {
+		t.Fatalf("nil callback error = %v", err)
+	}
+}
+
+// TestAgentInstallStepRunEmitsProgressWithSafeLabels proves agentInstallStep.Run
+// uses runCommandSequenceWithProgress (not runCommandSequence) when a callback
+// is wired, and that PI's multi-command sequence emits the expected safe
+// display labels. The non-TUI path (nil progress) keeps using runCommandSequence.
+func TestAgentInstallStepRunEmitsProgressWithSafeLabels(t *testing.T) {
+	binDir := t.TempDir()
+	fakePi := filepath.Join(binDir, "pi")
+	if err := os.WriteFile(fakePi, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake pi) error = %v", err)
+	}
+	fakeNpm := filepath.Join(binDir, "npm")
+	if err := os.WriteFile(fakeNpm, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake npm) error = %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	restorePreflightLookPath := installcmd.OverrideLookPath(func(name string) (string, error) {
+		switch name {
+		case "pi":
+			return fakePi, nil
+		case "npm":
+			return fakeNpm, nil
+		default:
+			return "", exec.ErrNotFound
+		}
+	})
+	t.Cleanup(restorePreflightLookPath)
+
+	restoreCommand := runCommand
+	t.Cleanup(func() { runCommand = restoreCommand })
+	runCommand = func(string, ...string) error { return nil }
+
+	t.Run("PI 9-command run emits 18 boundary events with known package labels", func(t *testing.T) {
+		var got []pipeline.ProgressEvent
+		step := agentInstallStep{
+			id:       "agent:pi",
+			agent:    model.AgentPi,
+			homeDir:  t.TempDir(),
+			progress: func(e pipeline.ProgressEvent) { got = append(got, e) },
+		}
+		if err := step.Run(); err != nil {
+			t.Fatalf("agentInstallStep.Run() error = %v", err)
+		}
+		if len(got) != 18 {
+			t.Fatalf("PI event count = %d, want 18 (2N for N=9)", len(got))
+		}
+		// Every event must carry a known-package literal (PI allowlist) or the
+		// engram-init bounded fallback, never raw argv.
+		allowed := map[string]bool{
+			"npm:gentle-pi": true, "npm:gentle-engram": true, "npm:pi-mcp-adapter": true,
+			"npm:pi-subagents-j0k3r": true, "npm:@juicesharp/rpiv-ask-user-question": true,
+			"npm:pi-web-access": true, "npm:@juicesharp/rpiv-todo": true, "npm:pi-btw": true,
+			"pi command engram-init": true,
+		}
+		for i, ev := range got {
+			if ev.Command == nil {
+				t.Fatalf("event %d: nil Command payload", i)
+			}
+			if !allowed[ev.Command.DisplayName] {
+				t.Fatalf("event %d: display name %q not in safe allowlist", i, ev.Command.DisplayName)
+			}
+			if ev.Command.Total != 9 {
+				t.Fatalf("event %d: total = %d, want 9", i, ev.Command.Total)
+			}
+		}
+	})
+
+	t.Run("non-PI agent emits fallback labels", func(t *testing.T) {
+		var got []pipeline.ProgressEvent
+		step := agentInstallStep{
+			id:       "agent:opencode",
+			agent:    model.AgentOpenCode,
+			homeDir:  t.TempDir(),
+			progress: func(e pipeline.ProgressEvent) { got = append(got, e) },
+		}
+		if err := step.Run(); err != nil {
+			t.Fatalf("agentInstallStep.Run() error = %v", err)
+		}
+		// OpenCode install resolves to a single command; total=1 still emits
+		// the 2N lifecycle at the boundary (START then SUCCEEDED).
+		for i, ev := range got {
+			if ev.Command == nil {
+				t.Fatalf("event %d: nil Command payload", i)
+			}
+			if !strings.HasPrefix(ev.Command.DisplayName, "opencode command ") {
+				t.Fatalf("event %d: expected fallback label, got %q", i, ev.Command.DisplayName)
+			}
+		}
+	})
+
+	t.Run("nil progress keeps runCommandSequence path", func(t *testing.T) {
+		// Non-TUI flow: nil progress must still succeed and emit nothing.
+		step := agentInstallStep{
+			id:      "agent:pi",
+			agent:   model.AgentPi,
+			homeDir: t.TempDir(),
+		}
+		if err := step.Run(); err != nil {
+			t.Fatalf("agentInstallStep.Run() nil progress error = %v", err)
+		}
+	})
+}

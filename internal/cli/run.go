@@ -762,7 +762,14 @@ func (s agentInstallStep) Run() error {
 		return fmt.Errorf("install command for %q resolved to an empty sequence (unsupported platform or resolver misconfiguration)", s.agent)
 	}
 
-	return runCommandSequence(commands)
+	// Non-TUI flows (nil progress) keep the original runCommandSequence path
+	// unchanged. TUI flows route through runCommandSequenceWithProgress so the
+	// command-progress transport can observe the per-command lifecycle at the
+	// executor boundary while preserving fail-fast semantics.
+	if s.progress == nil {
+		return runCommandSequence(commands)
+	}
+	return runCommandSequenceWithProgress(s.agent, s.id, commands, s.progress)
 }
 
 type kimiSystemPromptHubStep struct {
@@ -1440,6 +1447,65 @@ func runCommandSequence(commands [][]string) error {
 	}
 
 	return nil
+}
+
+// runCommandSequenceWithProgress is the TUI command executor boundary. It runs
+// each command in order, emitting exactly one START event and exactly one
+// terminal SUCCEEDED or FAILED event per attempted command through the
+// ProgressFunc. It preserves the existing fail-fast behavior: a failure at
+// command k halts the sequence and no later command runs. The DisplayName is
+// bounded by safeInstallDisplayName — raw argv never reaches the transport.
+// A nil callback is a no-op (non-TUI callers keep using runCommandSequence).
+//
+// The transport is best-effort by contract: the callback is invoked
+// synchronously, but consumers MUST reconcile against the pipeline terminal
+// result and MUST NOT rely on every intermediate event being delivered.
+func runCommandSequenceWithProgress(agent model.AgentID, stepID string, commands [][]string, progress pipeline.ProgressFunc) error {
+	if len(commands) == 0 {
+		return fmt.Errorf("empty command sequence")
+	}
+
+	total := len(commands)
+	for k, command := range commands {
+		if len(command) == 0 {
+			// Emit FAILED for this empty slot to keep the 2N lifecycle boundary
+			// consistent, then halt with the existing empty-command error.
+			emitCommandEvent(agent, stepID, command, k+1, total, pipeline.CommandProgressFailed, progress)
+			return fmt.Errorf("empty command in sequence")
+		}
+
+		current := k + 1
+		emitCommandEvent(agent, stepID, command, current, total, pipeline.CommandProgressStarted, progress)
+
+		if err := runCommand(command[0], command[1:]...); err != nil {
+			emitCommandEvent(agent, stepID, command, current, total, pipeline.CommandProgressFailed, progress)
+			return fmt.Errorf("run command %q: %w", strings.Join(command, " "), err)
+		}
+
+		emitCommandEvent(agent, stepID, command, current, total, pipeline.CommandProgressSucceeded, progress)
+	}
+
+	return nil
+}
+
+// emitCommandEvent builds the typed command-progress payload and invokes the
+// progress callback if non-nil. The display label is bounded by
+// safeInstallDisplayName so no raw argv leaks into the transport.
+func emitCommandEvent(agent model.AgentID, stepID string, command []string, current, total int, status pipeline.CommandProgressStatus, progress pipeline.ProgressFunc) {
+	if progress == nil {
+		return
+	}
+	label, _ := safeInstallDisplayName(agent, command, current)
+	progress(pipeline.ProgressEvent{
+		Command: &pipeline.CommandProgressEvent{
+			StepID:      stepID,
+			AgentID:     string(agent),
+			DisplayName: string(label),
+			Current:     current,
+			Total:       total,
+			Status:      status,
+		},
+	})
 }
 
 func executeCommand(name string, args ...string) error {
