@@ -292,3 +292,66 @@ func TestInstallViewProgressBypassesSingleCommandState(t *testing.T) {
 		t.Fatalf("single-command view = %+v, want compatibility with %+v", withSingleCommand, withoutProgress)
 	}
 }
+
+func TestPipelineDoneUsesTerminalResultWithoutPersistingCommandProgress(t *testing.T) {
+	m := installProgressModel().startCommandProgress()
+	m, _ = updateCommand(m, commandEvent("agent:pi", 2, pipeline.CommandProgressStarted))
+
+	result := pipeline.ExecutionResult{
+		Apply: pipeline.StageResult{
+			Success: true,
+			Steps: []pipeline.StepResult{
+				{StepID: "agent:pi", Status: pipeline.StepStatusSucceeded},
+				{StepID: "next", Status: pipeline.StepStatusSucceeded},
+			},
+		},
+	}
+	updated, _ := m.Update(PipelineDoneMsg{Result: result})
+	state := updated.(Model)
+	rendered := state.View()
+
+	if len(state.Execution.Apply.Steps) != 2 || state.Execution.Apply.Steps[0].StepID != "agent:pi" || state.Execution.Apply.Steps[0].Status != pipeline.StepStatusSucceeded {
+		t.Fatalf("terminal execution result = %+v, want completed pipeline steps", state.Execution)
+	}
+	if state.CommandProgress != (CommandProgressState{}) {
+		t.Fatalf("terminal result retained ephemeral command progress: %+v", state.CommandProgress)
+	}
+	if strings.Contains(rendered, "[2/3]") || strings.Contains(rendered, "Install Pi") {
+		t.Fatalf("post-install history rendered command progress: %q", rendered)
+	}
+}
+
+func TestFailedSingleCommandInstallRendersFailedStepWithoutCounter(t *testing.T) {
+	m := installProgressModel().startCommandProgress()
+	single := pipeline.CommandProgressEvent{
+		StepID:      "agent:pi",
+		Current:     1,
+		Total:       1,
+		DisplayName: "Install Pi",
+		Status:      pipeline.CommandProgressFailed,
+	}
+	m, _ = updateCommand(m, single)
+
+	result := pipeline.ExecutionResult{
+		Apply: pipeline.StageResult{
+			Success: false,
+			Steps: []pipeline.StepResult{
+				{StepID: "agent:pi", Status: pipeline.StepStatusFailed},
+				{StepID: "next", Status: pipeline.StepStatusSucceeded},
+			},
+		},
+	}
+	updated, _ := m.Update(PipelineDoneMsg{Result: result})
+	state := updated.(Model)
+	rendered := state.View()
+
+	if !state.Progress.HasFailures() || state.Progress.Items[0].Status != string(pipeline.StepStatusFailed) {
+		t.Fatalf("failed single-command step = %+v, want visible failed state", state.Progress)
+	}
+	if !strings.Contains(rendered, "agent:pi") || !strings.Contains(rendered, "Completed with errors: 1 succeeded, 1 failed") {
+		t.Fatalf("failed single-command install did not render normal failure state: %q", rendered)
+	}
+	if strings.Contains(rendered, "[1/1]") || strings.Contains(rendered, "Install Pi") {
+		t.Fatalf("failed single-command install rendered command counter or label: %q", rendered)
+	}
+}
