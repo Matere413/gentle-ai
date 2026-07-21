@@ -13,12 +13,16 @@ type ProgressItem struct {
 }
 
 type InstallProgress struct {
-	Percent     int
-	CurrentStep string
-	Items       []ProgressItem
-	Logs        []string
-	Done        bool
-	Failed      bool
+	Percent            int
+	CurrentStep        string
+	Items              []ProgressItem
+	Logs               []string
+	Done               bool
+	Failed             bool
+	CommandItemIndex   int
+	CommandCurrent     int
+	CommandTotal       int
+	CommandDisplayName string
 }
 
 func RenderInstalling(progress InstallProgress, spinner string) string {
@@ -37,7 +41,7 @@ func RenderInstalling(progress InstallProgress, spinner string) string {
 	}
 	b.WriteString("\n")
 
-	for _, item := range progress.Items {
+	for index, item := range progress.Items {
 		var icon string
 		switch item.Status {
 		case "succeeded":
@@ -49,7 +53,11 @@ func RenderInstalling(progress InstallProgress, spinner string) string {
 		default:
 			icon = styles.SubtextStyle.Render("·")
 		}
-		b.WriteString(fmt.Sprintf("  %s %s\n", icon, styles.UnselectedStyle.Render(item.Label)))
+		label := item.Label
+		if index == progress.CommandItemIndex && progress.CommandTotal > 1 && progress.CommandDisplayName != "" {
+			label = fmt.Sprintf("[%d/%d] %s", progress.CommandCurrent, progress.CommandTotal, progress.CommandDisplayName)
+		}
+		b.WriteString(fmt.Sprintf("  %s %s\n", icon, styles.UnselectedStyle.Render(label)))
 	}
 
 	if len(progress.Logs) > 0 {

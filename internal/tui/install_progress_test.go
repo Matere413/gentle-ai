@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -131,5 +132,61 @@ func TestPipelineDoneDoesNotCloseCompletedCommandListenerTwice(t *testing.T) {
 	updated, _ := started.Update(done)
 	if state := updated.(Model); state.commandProgressDone != nil {
 		t.Fatal("pipeline completion retained command listener lifecycle")
+	}
+}
+
+func TestInstallViewProgressUsesCompletedCommandsMonotonically(t *testing.T) {
+	m := installProgressModel().startCommandProgress()
+
+	m, _ = updateCommand(m, commandEvent("agent:pi", 2, pipeline.CommandProgressStarted))
+	started := m.Progress.ViewModel(m.CommandProgress)
+	if started.Percent != 16 || started.CommandCurrent != 2 || started.CommandTotal != 3 {
+		t.Fatalf("START view = %+v, want 16%% at 2/3", started)
+	}
+
+	m, _ = updateCommand(m, commandEvent("agent:pi", 2, pipeline.CommandProgressSucceeded))
+	succeeded := m.Progress.ViewModel(m.CommandProgress)
+	if succeeded.Percent != 33 {
+		t.Fatalf("SUCCEEDED percent = %d, want 33", succeeded.Percent)
+	}
+
+	m, _ = updateCommand(m, commandEvent("agent:pi", 2, pipeline.CommandProgressStarted))
+	delayed := m.Progress.ViewModel(m.CommandProgress)
+	if delayed.Percent != succeeded.Percent {
+		t.Fatalf("delayed START percent = %d, want %d", delayed.Percent, succeeded.Percent)
+	}
+	m, _ = updateCommand(m, commandEvent("agent:pi", 1, pipeline.CommandProgressStarted))
+	stale := m.Progress.ViewModel(m.CommandProgress)
+	if stale.Percent != succeeded.Percent || stale.CommandCurrent != 2 {
+		t.Fatalf("stale replay view = %+v, want monotonic 2/3 at %d%%", stale, succeeded.Percent)
+	}
+
+	m, _ = updateCommand(m, commandEvent("agent:pi", 3, pipeline.CommandProgressFailed))
+	failed := m.Progress.ViewModel(m.CommandProgress)
+	if failed.Percent != succeeded.Percent || failed.CommandCurrent != 3 || failed.CommandTotal != 3 {
+		t.Fatalf("FAILED view = %+v, want frozen %d%% at 3/3", failed, succeeded.Percent)
+	}
+}
+
+func TestInstallViewProgressRendersAndClearsLiveSubProgress(t *testing.T) {
+	m := installProgressModel().startCommandProgress()
+	m, _ = updateCommand(m, commandEvent("agent:pi", 2, pipeline.CommandProgressStarted))
+	if rendered := m.View(); !strings.Contains(rendered, "[2/3] Install Pi") {
+		t.Fatalf("rendered install row = %q, want safe counter and label", rendered)
+	}
+
+	updated, _ := m.Update(PipelineDoneMsg{})
+	if rendered := updated.(Model).View(); strings.Contains(rendered, "[2/3]") || strings.Contains(rendered, "Install Pi") {
+		t.Fatalf("post-install view retained sub-progress: %q", rendered)
+	}
+}
+
+func TestInstallViewProgressBypassesSingleCommandState(t *testing.T) {
+	m := installProgressModel()
+	withoutProgress := m.Progress.ViewModel()
+	m.CommandProgress = CommandProgressState{StepID: "agent:pi", Current: 1, Total: 1, Completed: 1, DisplayName: "Install Pi", LastStatus: pipeline.CommandProgressSucceeded}
+	withSingleCommand := m.Progress.ViewModel(m.CommandProgress)
+	if withSingleCommand.Percent != withoutProgress.Percent || withSingleCommand.CommandTotal != 0 || withSingleCommand.CommandDisplayName != "" {
+		t.Fatalf("single-command view = %+v, want compatibility with %+v", withSingleCommand, withoutProgress)
 	}
 }

@@ -110,7 +110,7 @@ func (p ProgressState) HasFailures() bool {
 	return false
 }
 
-func (p ProgressState) ViewModel() screens.InstallProgress {
+func (p ProgressState) ViewModel(commandProgress ...CommandProgressState) screens.InstallProgress {
 	items := make([]screens.ProgressItem, 0, len(p.Items))
 	for _, item := range p.Items {
 		items = append(items, screens.ProgressItem{Label: item.Label, Status: item.Status})
@@ -121,7 +121,7 @@ func (p ProgressState) ViewModel() screens.InstallProgress {
 		current = p.Items[p.Current].Label
 	}
 
-	return screens.InstallProgress{
+	view := screens.InstallProgress{
 		Percent:     p.Percent(),
 		CurrentStep: current,
 		Items:       items,
@@ -129,4 +129,31 @@ func (p ProgressState) ViewModel() screens.InstallProgress {
 		Done:        p.Percent() >= 100,
 		Failed:      p.HasFailures(),
 	}
+	if len(commandProgress) == 1 {
+		state := commandProgress[0]
+		if state.Total > 1 && state.Current >= 1 && p.Current >= 0 && p.Current < len(p.Items) {
+			view.Percent = p.interpolatedPercent(state)
+			view.CommandItemIndex = p.Current
+			view.CommandCurrent = state.Current
+			view.CommandTotal = state.Total
+			view.CommandDisplayName = state.DisplayName
+		}
+	}
+
+	return view
+}
+
+func (p ProgressState) interpolatedPercent(state CommandProgressState) int {
+	if state.Total <= 1 || len(p.Items) == 0 {
+		return p.Percent()
+	}
+
+	completedSteps := 0
+	for _, item := range p.Items {
+		if item.Status == string(pipeline.StepStatusSucceeded) || item.Status == string(pipeline.StepStatusFailed) {
+			completedSteps++
+		}
+	}
+	completedCommands := min(max(state.Completed, 0), state.Total)
+	return ((completedSteps*state.Total + completedCommands) * 100) / (len(p.Items) * state.Total)
 }

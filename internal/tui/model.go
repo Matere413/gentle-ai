@@ -215,11 +215,12 @@ const commandProgressBuffer = 32
 
 // CommandProgressState is live-only state for the currently running install step.
 type CommandProgressState struct {
-	StepID     string
-	Current    int
-	Total      int
-	Completed  int
-	LastStatus pipeline.CommandProgressStatus
+	StepID      string
+	DisplayName string
+	Current     int
+	Total       int
+	Completed   int
+	LastStatus  pipeline.CommandProgressStatus
 }
 
 type commandProgressMsg struct {
@@ -1174,6 +1175,7 @@ func (m Model) handleCommandProgress(msg commandProgressMsg) (tea.Model, tea.Cmd
 	}
 
 	state.StepID = event.StepID
+	state.DisplayName = event.DisplayName
 	state.Current = max(state.Current, event.Current)
 	state.Total = max(state.Total, event.Total)
 	switch event.Status {
@@ -1304,7 +1306,7 @@ func (m Model) View() string {
 	case ScreenReview:
 		return screens.RenderReview(m.Review, m.Cursor)
 	case ScreenInstalling:
-		return screens.RenderInstalling(m.Progress.ViewModel(), screens.SpinnerChar(m.SpinnerFrame))
+		return screens.RenderInstalling(m.Progress.ViewModel(m.CommandProgress), screens.SpinnerChar(m.SpinnerFrame))
 	case ScreenComplete:
 		return screens.RenderComplete(screens.CompletePayload{
 			ConfiguredAgents:    len(m.Selection.Agents),
