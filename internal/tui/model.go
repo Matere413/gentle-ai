@@ -223,8 +223,8 @@ type CommandProgressState struct {
 	LastStatus  pipeline.CommandProgressStatus
 }
 
-type commandProgressMsg struct {
-	event      pipeline.CommandProgressEvent
+type pipelineProgressMsg struct {
+	event      pipeline.ProgressEvent
 	generation uint64
 }
 
@@ -517,7 +517,7 @@ type Model struct {
 
 	// CommandProgress is intentionally ephemeral: pipeline results remain authoritative.
 	CommandProgress           CommandProgressState
-	commandProgressEvents     chan pipeline.CommandProgressEvent
+	commandProgressEvents     chan pipeline.ProgressEvent
 	commandProgressDone       chan struct{}
 	commandProgressDoneOnce   *sync.Once
 	commandProgressGeneration uint64
@@ -916,8 +916,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case StepProgressMsg:
 		return m.handleStepProgress(msg)
-	case commandProgressMsg:
-		return m.handleCommandProgress(msg)
+	case pipelineProgressMsg:
+		return m.handlePipelineProgress(msg)
 	case PipelineDoneMsg:
 		return m.handlePipelineDone(msg)
 	case BackupRestoreMsg:
@@ -1106,7 +1106,7 @@ func (m Model) startCommandProgress() Model {
 	m.closeCommandProgress()
 	m.commandProgressGeneration++
 	m.CommandProgress = CommandProgressState{}
-	m.commandProgressEvents = make(chan pipeline.CommandProgressEvent, commandProgressBuffer)
+	m.commandProgressEvents = make(chan pipeline.ProgressEvent, commandProgressBuffer)
 	m.commandProgressDone = make(chan struct{})
 	m.commandProgressDoneOnce = new(sync.Once)
 	return m
@@ -1133,7 +1133,7 @@ func (m *Model) clearCommandProgressFor(stepID string) {
 	}
 }
 
-func (m Model) commandProgress(event pipeline.CommandProgressEvent) {
+func (m Model) pipelineProgress(event pipeline.ProgressEvent) {
 	select {
 	case m.commandProgressEvents <- event:
 	default:
@@ -1145,19 +1145,27 @@ func (m Model) listenForCommandProgress() tea.Cmd {
 	return func() tea.Msg {
 		select {
 		case event := <-events:
-			return commandProgressMsg{event: event, generation: generation}
+			return pipelineProgressMsg{event: event, generation: generation}
 		case <-done:
 			return nil
 		}
 	}
 }
 
-func (m Model) handleCommandProgress(msg commandProgressMsg) (tea.Model, tea.Cmd) {
+func (m Model) handlePipelineProgress(msg pipelineProgressMsg) (tea.Model, tea.Cmd) {
 	if msg.generation != m.commandProgressGeneration || !m.pipelineRunning || m.Screen != ScreenInstalling {
 		return m, m.listenForCommandProgress()
 	}
 
-	event := msg.event
+	if msg.event.Command == nil {
+		updated, _ := m.handleStepProgress(StepProgressMsg{StepID: msg.event.StepID, Status: msg.event.Status, Err: msg.event.Err})
+		return updated, m.listenForCommandProgress()
+	}
+
+	return m.handleCommandProgress(*msg.event.Command)
+}
+
+func (m Model) handleCommandProgress(event pipeline.CommandProgressEvent) (tea.Model, tea.Cmd) {
 	idx := m.findProgressItem(event.StepID)
 	if idx != m.Progress.Current || idx < 0 || m.Progress.Items[idx].Status != ProgressStatusRunning || event.Current < 1 || event.Total < event.Current {
 		return m, m.listenForCommandProgress()
@@ -2730,9 +2738,7 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 
 	return m, tea.Batch(tickCmd(), func() tea.Msg {
 		onProgress := func(event pipeline.ProgressEvent) {
-			if event.Command != nil {
-				m.commandProgress(*event.Command)
-			}
+			m.pipelineProgress(event)
 		}
 
 		defer m.closeCommandProgress()

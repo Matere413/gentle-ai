@@ -26,8 +26,104 @@ func commandEvent(stepID string, current int, status pipeline.CommandProgressSta
 }
 
 func updateCommand(m Model, event pipeline.CommandProgressEvent) (Model, tea.Cmd) {
-	updated, cmd := m.Update(commandProgressMsg{event: event, generation: m.commandProgressGeneration})
+	updated, cmd := m.Update(pipelineProgressMsg{event: pipeline.ProgressEvent{StepID: event.StepID, Command: &event}, generation: m.commandProgressGeneration})
 	return updated.(Model), cmd
+}
+
+func updateBridge(m Model, event pipeline.ProgressEvent) (Model, tea.Cmd) {
+	updated, cmd := m.Update(pipelineProgressMsg{event: event, generation: m.commandProgressGeneration})
+	return updated.(Model), cmd
+}
+
+func TestStartInstallingBridgeRoutesStepAndCommandEventsInOrder(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "test")
+	m.DependencyPlan = planner.ResolvedPlan{Agents: []model.AgentID{model.AgentPi}}
+	ready := make(chan pipeline.ProgressFunc)
+	resume := make(chan struct{})
+	m.ExecuteFn = func(_ model.Selection, _ planner.ResolvedPlan, _ system.DetectionResult, progress pipeline.ProgressFunc) pipeline.ExecutionResult {
+		ready <- progress
+		<-resume
+		return pipeline.ExecutionResult{}
+	}
+
+	started, cmd := m.startInstalling()
+	batch := cmd().(tea.BatchMsg)
+	done := make(chan tea.Msg, 1)
+	go func() { done <- batch[1]() }()
+	progress := <-ready
+	model := started.(Model)
+	listener := batch[2]
+
+	sequence := []pipeline.ProgressEvent{
+		{StepID: "prepare:check-dependencies", Status: pipeline.StepStatusRunning},
+		{StepID: "prepare:check-dependencies", Status: pipeline.StepStatusSucceeded},
+		{StepID: "agent:pi", Status: pipeline.StepStatusRunning},
+		{StepID: "agent:pi", Command: &pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 1, Total: 2, DisplayName: "Install Pi", Status: pipeline.CommandProgressStarted}},
+		{StepID: "agent:pi", Command: &pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 1, Total: 2, DisplayName: "Install Pi", Status: pipeline.CommandProgressSucceeded}},
+		{StepID: "agent:pi", Command: &pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 2, Total: 2, DisplayName: "Configure Pi", Status: pipeline.CommandProgressSucceeded}},
+		{StepID: "agent:pi", Status: pipeline.StepStatusSucceeded},
+	}
+	for _, event := range sequence {
+		progress(event)
+		msg := listener()
+		model, listener = updateBridge(model, msg.(pipelineProgressMsg).event)
+	}
+
+	if model.Progress.Current != 4 || model.Progress.Items[3].Status != string(pipeline.StepStatusSucceeded) {
+		t.Fatalf("step lifecycle did not advance progress: %+v", model.Progress)
+	}
+	if model.CommandProgress != (CommandProgressState{}) {
+		t.Fatalf("step terminal retained command progress: %+v", model.CommandProgress)
+	}
+	close(resume)
+	updated, _ := model.Update(<-done)
+	if state := updated.(Model); state.CommandProgress != (CommandProgressState{}) || state.pipelineRunning {
+		t.Fatalf("pipeline completion did not reconcile bridge state: %+v", state)
+	}
+}
+
+func TestStartInstallingBridgeClearsFailedStepAndIgnoresLateCommand(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "test")
+	m.DependencyPlan = planner.ResolvedPlan{Agents: []model.AgentID{model.AgentPi}}
+	ready := make(chan pipeline.ProgressFunc)
+	resume := make(chan struct{})
+	m.ExecuteFn = func(_ model.Selection, _ planner.ResolvedPlan, _ system.DetectionResult, progress pipeline.ProgressFunc) pipeline.ExecutionResult {
+		ready <- progress
+		<-resume
+		return pipeline.ExecutionResult{}
+	}
+
+	started, cmd := m.startInstalling()
+	batch := cmd().(tea.BatchMsg)
+	done := make(chan tea.Msg, 1)
+	go func() { done <- batch[1]() }()
+	progress := <-ready
+	state := started.(Model)
+	listener := batch[2]
+	for _, event := range []pipeline.ProgressEvent{
+		{StepID: "agent:pi", Status: pipeline.StepStatusRunning},
+		{StepID: "agent:pi", Command: &pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 2, Total: 3, DisplayName: "Configure Pi", Status: pipeline.CommandProgressStarted}},
+		{StepID: "agent:pi", Command: &pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 2, Total: 3, DisplayName: "Configure Pi", Status: pipeline.CommandProgressFailed}},
+		{StepID: "agent:pi", Status: pipeline.StepStatusFailed},
+	} {
+		progress(event)
+		message := listener().(pipelineProgressMsg)
+		state, listener = updateBridge(state, message.event)
+	}
+	if state.Progress.Items[3].Status != string(pipeline.StepStatusFailed) || state.CommandProgress != (CommandProgressState{}) {
+		t.Fatalf("failed step did not become authoritative: progress=%+v command=%+v", state.Progress, state.CommandProgress)
+	}
+
+	late := pipeline.CommandProgressEvent{StepID: "agent:pi", Current: 3, Total: 3, DisplayName: "Late", Status: pipeline.CommandProgressStarted}
+	state, _ = updateBridge(state, pipeline.ProgressEvent{StepID: late.StepID, Command: &late})
+	if state.CommandProgress != (CommandProgressState{}) {
+		t.Fatalf("late command mutated terminal step: %+v", state.CommandProgress)
+	}
+	close(resume)
+	updated, _ := state.Update(<-done)
+	if reconciled := updated.(Model); reconciled.CommandProgress != (CommandProgressState{}) {
+		t.Fatalf("pipeline done retained failed command state: %+v", reconciled.CommandProgress)
+	}
 }
 
 func TestCommandProgressTransportDoesNotBlockAndResubscribes(t *testing.T) {
@@ -36,7 +132,8 @@ func TestCommandProgressTransportDoesNotBlockAndResubscribes(t *testing.T) {
 	finished := make(chan struct{})
 	go func() {
 		for i := 0; i < commandProgressBuffer+1; i++ {
-			m.commandProgress(commandEvent("agent:pi", 1, pipeline.CommandProgressStarted))
+			event := commandEvent("agent:pi", 1, pipeline.CommandProgressStarted)
+			m.pipelineProgress(pipeline.ProgressEvent{StepID: event.StepID, Command: &event})
 		}
 		close(finished)
 	}()
@@ -55,17 +152,21 @@ func TestCommandProgressTransportDoesNotBlockAndResubscribes(t *testing.T) {
 	}
 
 	m = installProgressModel().startCommandProgress()
-	m.commandProgressEvents = make(chan pipeline.CommandProgressEvent, 2)
-	m.commandProgress(commandEvent("agent:pi", 1, pipeline.CommandProgressStarted))
-	m.commandProgress(commandEvent("agent:pi", 2, pipeline.CommandProgressSucceeded))
+	m.commandProgressEvents = make(chan pipeline.ProgressEvent, 2)
+	firstEvent := commandEvent("agent:pi", 1, pipeline.CommandProgressStarted)
+	secondEvent := commandEvent("agent:pi", 2, pipeline.CommandProgressSucceeded)
+	m.pipelineProgress(pipeline.ProgressEvent{StepID: firstEvent.StepID, Command: &firstEvent})
+	m.pipelineProgress(pipeline.ProgressEvent{StepID: secondEvent.StepID, Command: &secondEvent})
 	cmd := m.listenForCommandProgress()
-	first := cmd().(commandProgressMsg)
-	m, cmd = updateCommand(m, first.event)
+	first := cmd().(pipelineProgressMsg)
+	updated, cmd = m.Update(first)
+	m = updated.(Model)
 	if m.CommandProgress.Current != 1 || cmd == nil {
 		t.Fatalf("first event = %+v, listener = %v", m.CommandProgress, cmd != nil)
 	}
-	second := cmd().(commandProgressMsg)
-	m, _ = updateCommand(m, second.event)
+	second := cmd().(pipelineProgressMsg)
+	updated, _ = m.Update(second)
+	m = updated.(Model)
 	if m.CommandProgress.Current != 2 || m.CommandProgress.Completed != 2 {
 		t.Fatalf("second event = %+v", m.CommandProgress)
 	}
@@ -104,7 +205,8 @@ func TestCommandProgressReconcilesDropsOutOfOrderAndStaleGeneration(t *testing.T
 		t.Fatalf("replayed start regressed state: %+v", m.CommandProgress)
 	}
 
-	stale := commandProgressMsg{event: commandEvent("agent:pi", 2, pipeline.CommandProgressStarted), generation: m.commandProgressGeneration - 1}
+	staleEvent := commandEvent("agent:pi", 2, pipeline.CommandProgressStarted)
+	stale := pipelineProgressMsg{event: pipeline.ProgressEvent{StepID: staleEvent.StepID, Command: &staleEvent}, generation: m.commandProgressGeneration - 1}
 	updated, _ := m.Update(stale)
 	m = updated.(Model)
 	if m.CommandProgress.Current != 3 || m.CommandProgress.LastStatus != pipeline.CommandProgressSucceeded {
