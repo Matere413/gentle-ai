@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -208,6 +209,22 @@ type StepProgressMsg struct {
 // PipelineDoneMsg is sent when the pipeline finishes execution.
 type PipelineDoneMsg struct {
 	Result pipeline.ExecutionResult
+}
+
+const commandProgressBuffer = 32
+
+// CommandProgressState is live-only state for the currently running install step.
+type CommandProgressState struct {
+	StepID     string
+	Current    int
+	Total      int
+	Completed  int
+	LastStatus pipeline.CommandProgressStatus
+}
+
+type commandProgressMsg struct {
+	event      pipeline.CommandProgressEvent
+	generation uint64
 }
 
 // BackupRestoreMsg is sent when a backup restore completes.
@@ -496,6 +513,13 @@ type Model struct {
 
 	// pipelineRunning tracks whether the pipeline goroutine is active.
 	pipelineRunning bool
+
+	// CommandProgress is intentionally ephemeral: pipeline results remain authoritative.
+	CommandProgress           CommandProgressState
+	commandProgressEvents     chan pipeline.CommandProgressEvent
+	commandProgressDone       chan struct{}
+	commandProgressDoneOnce   *sync.Once
+	commandProgressGeneration uint64
 
 	// TUI operations — set by startUpgrade / startSync / startUpgradeSync goroutines.
 
@@ -891,6 +915,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case StepProgressMsg:
 		return m.handleStepProgress(msg)
+	case commandProgressMsg:
+		return m.handleCommandProgress(msg)
 	case PipelineDoneMsg:
 		return m.handlePipelineDone(msg)
 	case BackupRestoreMsg:
@@ -1032,6 +1058,7 @@ func (m Model) handleStepProgress(msg StepProgressMsg) (tea.Model, tea.Cmd) {
 	case pipeline.StepStatusSucceeded:
 		m.Progress.Mark(idx, string(pipeline.StepStatusSucceeded))
 		m.Progress.AppendLog("done: %s", msg.StepID)
+		m.clearCommandProgressFor(msg.StepID)
 	case pipeline.StepStatusFailed:
 		m.Progress.Mark(idx, string(pipeline.StepStatusFailed))
 		errMsg := "unknown error"
@@ -1039,6 +1066,7 @@ func (m Model) handleStepProgress(msg StepProgressMsg) (tea.Model, tea.Cmd) {
 			errMsg = msg.Err.Error()
 		}
 		m.Progress.AppendLog("FAILED: %s — %s", msg.StepID, errMsg)
+		m.clearCommandProgressFor(msg.StepID)
 	}
 
 	return m, nil
@@ -1047,6 +1075,7 @@ func (m Model) handleStepProgress(msg StepProgressMsg) (tea.Model, tea.Cmd) {
 func (m Model) handlePipelineDone(msg PipelineDoneMsg) (tea.Model, tea.Cmd) {
 	m.Execution = msg.Result
 	m.pipelineRunning = false
+	m.stopCommandProgress()
 
 	// Rebuild progress from real step results so failed steps show ✗ instead
 	// of being blindly marked as succeeded.
@@ -1070,6 +1099,96 @@ func (m Model) handlePipelineDone(msg PipelineDoneMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m Model) startCommandProgress() Model {
+	m.closeCommandProgress()
+	m.commandProgressGeneration++
+	m.CommandProgress = CommandProgressState{}
+	m.commandProgressEvents = make(chan pipeline.CommandProgressEvent, commandProgressBuffer)
+	m.commandProgressDone = make(chan struct{})
+	m.commandProgressDoneOnce = new(sync.Once)
+	return m
+}
+
+func (m *Model) stopCommandProgress() {
+	m.closeCommandProgress()
+	m.CommandProgress = CommandProgressState{}
+	m.commandProgressEvents = nil
+	m.commandProgressDone = nil
+	m.commandProgressDoneOnce = nil
+}
+
+// closeCommandProgress is the sole owner of command listener cancellation.
+func (m Model) closeCommandProgress() {
+	if m.commandProgressDone != nil && m.commandProgressDoneOnce != nil {
+		m.commandProgressDoneOnce.Do(func() { close(m.commandProgressDone) })
+	}
+}
+
+func (m *Model) clearCommandProgressFor(stepID string) {
+	if m.CommandProgress.StepID == stepID {
+		m.CommandProgress = CommandProgressState{}
+	}
+}
+
+func (m Model) commandProgress(event pipeline.CommandProgressEvent) {
+	select {
+	case m.commandProgressEvents <- event:
+	default:
+	}
+}
+
+func (m Model) listenForCommandProgress() tea.Cmd {
+	events, done, generation := m.commandProgressEvents, m.commandProgressDone, m.commandProgressGeneration
+	return func() tea.Msg {
+		select {
+		case event := <-events:
+			return commandProgressMsg{event: event, generation: generation}
+		case <-done:
+			return nil
+		}
+	}
+}
+
+func (m Model) handleCommandProgress(msg commandProgressMsg) (tea.Model, tea.Cmd) {
+	if msg.generation != m.commandProgressGeneration || !m.pipelineRunning || m.Screen != ScreenInstalling {
+		return m, m.listenForCommandProgress()
+	}
+
+	event := msg.event
+	idx := m.findProgressItem(event.StepID)
+	if idx != m.Progress.Current || idx < 0 || m.Progress.Items[idx].Status != ProgressStatusRunning || event.Current < 1 || event.Total < event.Current {
+		return m, m.listenForCommandProgress()
+	}
+
+	state := m.CommandProgress
+	if state.StepID != "" && state.StepID != event.StepID {
+		return m, m.listenForCommandProgress()
+	}
+	if state.StepID == event.StepID && event.Current < state.Current {
+		return m, m.listenForCommandProgress()
+	}
+	if state.StepID == event.StepID && event.Current == state.Current && (state.LastStatus == pipeline.CommandProgressSucceeded || state.LastStatus == pipeline.CommandProgressFailed) {
+		return m, m.listenForCommandProgress()
+	}
+
+	state.StepID = event.StepID
+	state.Current = max(state.Current, event.Current)
+	state.Total = max(state.Total, event.Total)
+	switch event.Status {
+	case pipeline.CommandProgressStarted:
+		state.Completed = max(state.Completed, event.Current-1)
+	case pipeline.CommandProgressSucceeded:
+		state.Completed = max(state.Completed, event.Current)
+	case pipeline.CommandProgressFailed:
+		state.Completed = max(state.Completed, event.Current-1)
+	default:
+		return m, m.listenForCommandProgress()
+	}
+	state.LastStatus = event.Status
+	m.CommandProgress = state
+	return m, m.listenForCommandProgress()
 }
 
 func (m Model) handleBackupRestore(msg BackupRestoreMsg) (tea.Model, tea.Cmd) {
@@ -2599,6 +2718,7 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 	}
 
 	m.pipelineRunning = true
+	m = m.startCommandProgress()
 
 	// Capture values for the goroutine closure.
 	executeFn := m.ExecuteFn
@@ -2608,16 +2728,15 @@ func (m Model) startInstalling() (tea.Model, tea.Cmd) {
 
 	return m, tea.Batch(tickCmd(), func() tea.Msg {
 		onProgress := func(event pipeline.ProgressEvent) {
-			// NOTE: ProgressFunc is called synchronously from the pipeline goroutine.
-			// We cannot use p.Send() here because we don't have a reference to the
-			// tea.Program. Instead, these events are collected in the ExecutionResult
-			// and the PipelineDoneMsg handles the final state. For real-time updates,
-			// we rely on the pipeline calling this synchronously from each step.
+			if event.Command != nil {
+				m.commandProgress(*event.Command)
+			}
 		}
 
+		defer m.closeCommandProgress()
 		result := executeFn(selection, resolved, detection, onProgress)
 		return PipelineDoneMsg{Result: result}
-	})
+	}, m.listenForCommandProgress())
 }
 
 // withResetSyncState clears sync-result state so ScreenSync shows the confirmation
