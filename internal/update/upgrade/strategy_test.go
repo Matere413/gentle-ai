@@ -557,7 +557,7 @@ func TestRunStrategyOpenCodePluginUpgradesMaterializedPackage(t *testing.T) {
 	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(`{"version":"0.1.0"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pkgDir, "package.json"), []byte(`{"version":"0.2.0"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cacheRoot := filepath.Join(home, ".cache", "opencode", "packages")

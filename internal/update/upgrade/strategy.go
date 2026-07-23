@@ -65,7 +65,68 @@ const maxScriptSize = 1 * 1024 * 1024 // 1 MB
 //   - script method + windows → manualFallback
 //   - OpenCode plugin method → update materialized package in ~/.config/opencode when possible
 //   - unknown method → manualFallback with explicit message
+//
+// strategyOutcome is the richer result of runStrategyWithOutcome. It carries
+// the exitRequested flag (for Windows self-replace strategies) plus, for the
+// target OpenCode plugin upgrade, the exact observed materialized version. A
+// non-empty observedVersion means verification succeeded; an empty value means
+// the strategy either did not verify materialization (other OpenCode plugins,
+// dry-run-adjacent paths) or did not request an exit.
+type strategyOutcome struct {
+	exitRequested   bool
+	observedVersion string // non-empty only for exact target-plugin verification
+}
+
+// runStrategyWithOutcome is the richer sibling of runStrategy: it returns a
+// strategyOutcome so callers (executeOne) can populate NewVersion from the
+// exact observed materialized version rather than from pre-command metadata.
+// runStrategy remains as a compatibility wrapper that returns only exitRequested.
+func runStrategyWithOutcome(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) (strategyOutcome, error) {
+	outcome, err := runStrategyImpl(ctx, r, profile)
+	if err != nil {
+		return strategyOutcome{}, err
+	}
+	return outcome, nil
+}
+
+// runStrategy is a compatibility wrapper preserving the historical (bool, error)
+// contract for the existing non-OpenCode strategies and their tests. It delegates
+// to runStrategyWithOutcome and discards the observed version, which only the
+// target OpenCode plugin upgrade populates.
 func runStrategy(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) (bool, error) {
+	outcome, err := runStrategyWithOutcome(ctx, r, profile)
+	if err != nil {
+		return false, err
+	}
+	return outcome.exitRequested, nil
+}
+
+// runStrategyImpl holds the original strategy dispatch. The only behavioral
+// change for the fix-opencode-plugin-upgrade-verification change is that the
+// target OpenCode plugin (`opencode-subagent-statusline`) now goes through
+// opencodeSubagentStatuslineUpgrade, which verifies exact materialization and
+// may retry once. All other methods — including the generic OpenCode plugin
+// path used by other plugins — are preserved verbatim.
+func runStrategyImpl(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) (strategyOutcome, error) {
+	if r.Tool.InstallMethod == update.InstallOpenCodePlugin && r.Tool.Name == openCodeTargetPlugin {
+		observed, err := opencodeSubagentStatuslineUpgrade(ctx, r)
+		if err != nil {
+			return strategyOutcome{}, err
+		}
+		return strategyOutcome{observedVersion: observed}, nil
+	}
+
+	exitRequested, err := runStrategyLegacy(ctx, r, profile)
+	if err != nil {
+		return strategyOutcome{}, err
+	}
+	return strategyOutcome{exitRequested: exitRequested}, nil
+}
+
+// runStrategyLegacy is the pre-change strategy dispatch, unchanged for every
+// non-target method. It is split out so the target-plugin verifier cannot
+// accidentally alter other-plugin behavior.
+func runStrategyLegacy(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) (bool, error) {
 	ownership := update.HomebrewNone
 	if profile.PackageManager == "brew" && r.Tool.InstallMethod != update.InstallOpenCodePlugin {
 		var err error
@@ -111,6 +172,17 @@ func runStrategy(ctx context.Context, r update.UpdateResult, profile system.Plat
 		}
 	}
 }
+
+// openCodeTargetPlugin is the single plugin whose upgrade verification is
+// changed by fix-opencode-plugin-upgrade-verification (issue #744). Other
+// OpenCode plugins continue to use the prior success-on-exit-code behavior
+// until a separate follow-up. Scope boundary is enforced by this constant.
+const openCodeTargetPlugin = "opencode-subagent-statusline"
+
+// maxOpenCodeUpgradeAttempts bounds the target-plugin upgrade to a single
+// retry: one initial package-manager attempt plus at most one more when the
+// first exits 0 but the manifest is absent, stale, malformed, or unreadable.
+const maxOpenCodeUpgradeAttempts = 2
 
 func opencodePluginUpgrade(ctx context.Context, r update.UpdateResult) error {
 	pkg := strings.TrimSpace(r.Tool.NpmPackage)
@@ -185,6 +257,200 @@ func opencodePluginUpgrade(ctx context.Context, r update.UpdateResult) error {
 		return fmt.Errorf("clear OpenCode package cache for %s: %w", pkg, err)
 	}
 	return nil
+}
+
+// opencodeSubagentStatuslineUpgrade runs the target OpenCode plugin upgrade
+// and verifies that the installed manifest reports the EXACT expected
+// LatestVersion. Unlike opencodePluginUpgrade, it never treats a package-
+// manager exit code of 0 as success on its own: success requires the observed
+// materialized version to equal LatestVersion byte-for-byte.
+//
+// The setup (home directory, opencode directory, package manager, registration
+// precheck, and targets) is computed once and reused across attempts. Only the
+// idempotent package-manager operation is retried, at most once. Context
+// cancellation is checked before the retry so a cancelled upgrade does not
+// issue an extra command. The npm ERESOLVE legacy-peer-deps recovery stays
+// inside a single logical attempt and is NOT counted as the verification
+// retry. On a non-exact, absent, malformed, or unreadable manifest after the
+// retry budget is exhausted, a ManualFallbackError carrying the expected and
+// observed (or "absent") versions plus the configured OpenCode directory is
+// returned so the executor renders a truthful skip.
+func opencodeSubagentStatuslineUpgrade(ctx context.Context, r update.UpdateResult) (string, error) {
+	pkg := strings.TrimSpace(r.Tool.NpmPackage)
+	if pkg == "" {
+		return "", &ManualFallbackError{Hint: openCodePluginManualHint(r)}
+	}
+
+	homeDir, err := openCodeHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return "", &ManualFallbackError{Hint: fmt.Sprintf("%s Could not resolve the user home directory; update %s manually.", openCodePluginManualHint(r), pkg)}
+	}
+
+	opencodeDir := filepath.Join(homeDir, ".config", "opencode")
+	info, err := os.Stat(opencodeDir)
+	if err != nil || !info.IsDir() {
+		return "", &ManualFallbackError{Hint: fmt.Sprintf("%s OpenCode config directory was not found at %s; %s is not installed/materialized yet.", openCodePluginManualHint(r), opencodeDir, pkg)}
+	}
+
+	materialized, registered, err := openCodePluginRegisteredOrMaterialized(opencodeDir, pkg)
+	if err != nil {
+		return "", fmt.Errorf("inspect OpenCode plugin %s: %w", pkg, err)
+	}
+	if !materialized && !registered && r.Status != update.RegisteredNotMaterialized {
+		return "", &ManualFallbackError{Hint: fmt.Sprintf("%s %s is not registered in tui.json and is not present in node_modules; start/reload OpenCode first so it materializes the plugin.", openCodePluginManualHint(r), pkg)}
+	}
+
+	pm, err := selectOpenCodePackageManager(opencodeDir)
+	if err != nil {
+		return "", &ManualFallbackError{Hint: fmt.Sprintf("OpenCode plugin %s can be upgraded from %s, but no supported package manager is available in PATH. Install bun or npm, then run update tools again.", pkg, opencodeDir)}
+	}
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+
+	expected := strings.TrimSpace(r.LatestVersion)
+	targets := []string{pkg + "@latest", "@opencode-ai/plugin@latest"}
+
+	for attempt := 1; attempt <= maxOpenCodeUpgradeAttempts; attempt++ {
+		if err := runOpenCodePluginCommand(ctx, pm, pkg, opencodeDir, targets); err != nil {
+			return "", err
+		}
+		if err := clearOpenCodePluginPackageCache(homeDir, pkg); err != nil {
+			return "", fmt.Errorf("clear OpenCode package cache for %s: %w", pkg, err)
+		}
+
+		observed, verr := inspectOpenCodePluginManifest(opencodeDir, pkg)
+		if verr == nil && observed == expected {
+			return observed, nil
+		}
+
+		// On the last attempt, convert any verification failure into an
+		// actionable manual fallback. On earlier attempts, retry once after a
+		// context check.
+		if attempt == maxOpenCodeUpgradeAttempts {
+			return "", openCodePluginVerificationFallback(r, pkg, opencodeDir, expected, observed, verr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+	}
+
+	// Unreachable: the loop always returns. Kept for clarity.
+	return "", openCodePluginVerificationFallback(r, pkg, opencodeDir, expected, "", nil)
+}
+
+// runOpenCodePluginCommand executes a single package-manager attempt for the
+// target plugin, preserving the existing argv, cmd.Dir, nil stdin, and
+// noninteractive environment seams. npm ERESOLVE legacy-peer-deps recovery
+// stays inside this single logical attempt.
+func runOpenCodePluginCommand(ctx context.Context, pm, pkg, opencodeDir string, targets []string) error {
+	var cmd *exec.Cmd
+	switch pm {
+	case "bun":
+		cmd = execCommand("bun", append([]string{"add"}, targets...)...)
+	case "npm":
+		cmd = execCommand("npm", append([]string{"install", "--save", "--no-audit", "--no-fund"}, targets...)...)
+	default:
+		return &ManualFallbackError{Hint: fmt.Sprintf("unsupported OpenCode package manager %q for %s", pm, pkg)}
+	}
+	cmd.Dir = opencodeDir
+	cmd.Stdin = nil
+	cmd.Env = openCodePluginUpgradeEnv(cmd.Env)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		outStr := string(out)
+		if pm == "npm" && npmErrorCode(outStr) == "ERESOLVE" {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			fmt.Fprintln(os.Stderr, "WARNING: npm reported an ERESOLVE peer dependency conflict; retrying with --legacy-peer-deps")
+			retryCmd := execCommand("npm", append([]string{"install", "--save", "--no-audit", "--no-fund", "--legacy-peer-deps"}, targets...)...)
+			retryCmd.Dir = opencodeDir
+			retryCmd.Stdin = nil
+			retryCmd.Env = openCodePluginUpgradeEnv(retryCmd.Env)
+			if retryOut, retryErr := retryCmd.CombinedOutput(); retryErr != nil {
+				return fmt.Errorf("%s upgrade %s in %s: retry with --legacy-peer-deps failed: %w (retry output: %s); original error: %v (original output: %s)", pm, pkg, opencodeDir, retryErr, string(retryOut), err, outStr)
+			}
+		} else {
+			return fmt.Errorf("%s upgrade %s in %s: %w (output: %s)", pm, pkg, opencodeDir, err, outStr)
+		}
+	}
+	return nil
+}
+
+// inspectOpenCodePluginManifest reads node_modules/<pkg>/package.json and
+// returns the trimmed "version" field. It distinguishes four verification
+// failures so the fallback hint can describe them:
+//   - manifest absent (no node_modules entry)
+//   - manifest malformed (unparseable JSON)
+//   - manifest unreadable (read/permission error)
+//   - observed version differs from expected (returned as observed value with nil err)
+//
+// The comparison against the expected version is exact: no semver normalization,
+// coercion, or acceptance of a newer version. observed is "" only when the
+// manifest is absent, malformed, or unreadable.
+func inspectOpenCodePluginManifest(opencodeDir, pkg string) (string, error) {
+	manifestPath := filepath.Join(opencodeDir, "node_modules", pkg, "package.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", &openCodeManifestError{kind: "absent", path: manifestPath}
+		}
+		return "", &openCodeManifestError{kind: "unreadable", path: manifestPath, err: err}
+	}
+	var manifest struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return "", &openCodeManifestError{kind: "malformed", path: manifestPath, err: err}
+	}
+	return strings.TrimSpace(manifest.Version), nil
+}
+
+// openCodeManifestError describes a manifest verification failure so the
+// fallback hint can name the specific failure mode.
+type openCodeManifestError struct {
+	kind string
+	path string
+	err  error
+}
+
+func (e *openCodeManifestError) Error() string {
+	switch e.kind {
+	case "absent":
+		return fmt.Sprintf("open code plugin manifest absent at %s", e.path)
+	case "malformed":
+		return fmt.Sprintf("parse open code plugin manifest %s: %v", e.path, e.err)
+	case "unreadable":
+		return fmt.Sprintf("read open code plugin manifest %s: %v", e.path, e.err)
+	default:
+		return fmt.Sprintf("open code plugin manifest %s: %v", e.path, e.err)
+	}
+}
+
+// openCodePluginVerificationFallback builds the actionable ManualFallbackError
+// when verification cannot confirm exact materialization. It includes the
+// plugin name, the expected LatestVersion, the observed version (or "absent"),
+// a description of any manifest read/parse failure, and the configured OpenCode
+// directory the user should inspect manually.
+func openCodePluginVerificationFallback(r update.UpdateResult, pkg, opencodeDir, expected, observed string, verr error) error {
+	observedText := observed
+	if observedText == "" {
+		observedText = "absent"
+	}
+	detail := ""
+	if verr != nil {
+		detail = fmt.Sprintf(" (%s)", verr.Error())
+	}
+	hint := fmt.Sprintf("OpenCode plugin %s upgrade could not be verified: expected version %q but observed %q%s. Inspect the OpenCode directory at %s (node_modules/%s/package.json) and update manually if needed.", pkg, expected, observedText, detail, opencodeDir, pkg)
+	return &ManualFallbackError{Hint: hint}
 }
 
 func npmErrorCode(output string) string {
