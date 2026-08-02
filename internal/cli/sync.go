@@ -1320,6 +1320,9 @@ func validatePersistedSyncState(persisted state.InstallState, readErr error) err
 	if persisted.Persona == "" {
 		return nil
 	}
+	if strings.TrimSpace(persisted.Persona) == "" {
+		return fmt.Errorf("validate persisted persona: whitespace-only persona is not valid")
+	}
 	if _, err := normalizePersona(persisted.Persona); err != nil {
 		return fmt.Errorf("validate persisted persona: %w", err)
 	}
