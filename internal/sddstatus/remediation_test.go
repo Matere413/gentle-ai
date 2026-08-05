@@ -35,6 +35,117 @@ func TestParseRemediationResultRequiresExactTransactionBinding(t *testing.T) {
 	}
 }
 
+func TestParseRemediationResultCumulativeProgress(t *testing.T) {
+	revision := "sha256:" + strings.Repeat("d", 64)
+	binding := RemediationBinding{LineageID: "lineage-1", Generation: 2, FixBatch: 2}
+
+	otherRevision := "sha256:" + strings.Repeat("e", 64)
+	otherLineage := RemediationBinding{LineageID: "lineage-2", Generation: 2, FixBatch: 2}
+	otherGeneration := binding
+	otherGeneration.Generation++
+	otherFixBatch := binding
+	otherFixBatch.FixBatch++
+
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{
+			name: "accepts earlier history with different revision",
+			text: remediationResultEvidenceWithBinding(otherRevision, binding) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+			want: true,
+		},
+		{
+			name: "accepts earlier history with different lineage",
+			text: remediationResultEvidenceWithBinding(revision, otherLineage) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+			want: true,
+		},
+		{
+			name: "accepts earlier history with different generation",
+			text: remediationResultEvidenceWithBinding(revision, otherGeneration) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+			want: true,
+		},
+		{
+			name: "accepts earlier history with different fix batch",
+			text: remediationResultEvidenceWithBinding(revision, otherFixBatch) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+			want: true,
+		},
+		{
+			name: "rejects duplicate strict pair",
+			text: remediationResultEvidenceWithBinding(revision, binding) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+		},
+		{
+			name: "rejects duplicate legacy json result",
+			text: legacyRemediationResult(revision, binding) + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+		},
+		{
+			name: "rejects duplicate blockquoted result",
+			text: quoteRemediationEnvelope(remediationEnvelopeWithBinding(revision, binding), "> ") + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+		},
+		{
+			name: "rejects duplicate nested blockquoted result",
+			text: quoteRemediationEnvelope(remediationEnvelopeWithBinding(revision, binding), "> > ") + "\n\n" + remediationResultEvidenceWithBinding(revision, binding),
+		},
+		{
+			name: "rejects non-adjacent evidence",
+			text: strings.Replace(remediationResultEvidenceWithBinding(revision, binding), "\n```json\n", "\nprogress prose\n```json\n", 1),
+		},
+		{
+			name: "rejects invalid trailing content",
+			text: remediationResultEvidenceWithBinding(revision, binding) + "\ntrailing prose",
+		},
+		{
+			name: "allows unrelated closed fences and inline fence prose",
+			text: strings.Join([]string{
+				"A literal ```yaml marker remains prose.",
+				"```text",
+				"unrelated content",
+				"```",
+				remediationResultEvidenceWithBinding(revision, binding),
+			}, "\n"),
+			want: true,
+		},
+		{
+			name: "allows a closed bare fence after the valid pair",
+			text: remediationResultEvidenceWithBinding(revision, binding) + "\n```\nunrelated content\n```",
+			want: true,
+		},
+		{
+			name: "rejects a pair inside an unclosed bare fence",
+			text: "```\n" + remediationResultEvidenceWithBinding(revision, binding),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRemediationResult(tc.text, revision, binding).Complete
+			if got != tc.want {
+				t.Fatalf("parseRemediationResult(...).Complete = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseRemediationResultRejectsManyUnclosedFences(t *testing.T) {
+	text := strings.Repeat("```yaml\n", 4096)
+	if got := parseRemediationResult(text, "sha256:"+strings.Repeat("d", 64)); got.Complete {
+		t.Fatal("many unclosed fences passed remediation parsing")
+	}
+}
+
+func TestParseRemediationResultMultipleBindingsPreserveEvidenceRevision(t *testing.T) {
+	revision := "sha256:" + strings.Repeat("d", 64)
+	binding := RemediationBinding{LineageID: "lineage-1", Generation: 2, FixBatch: 2}
+	got := parseRemediationResult(remediationResultEvidenceWithBinding(revision, binding), revision, binding, binding)
+	if got.Complete {
+		t.Fatal("remediation evidence passed with multiple bindings")
+	}
+	if got.EvidenceRevision != revision {
+		t.Fatalf("EvidenceRevision = %q, want %q", got.EvidenceRevision, revision)
+	}
+}
+
 func remediationEnvelope(revision string) string {
 	return strings.Join([]string{
 		"```yaml",
@@ -67,12 +178,7 @@ func remediationResultEvidence(revision string) string {
 }
 
 func remediationResultEvidenceWithBinding(revision string, binding RemediationBinding) string {
-	envelope := strings.Replace(remediationEnvelope(revision), "focused_tests: passed", strings.Join([]string{
-		"lineage_id: " + binding.LineageID,
-		"generation: " + strconv.Itoa(binding.Generation),
-		"fix_batch: " + strconv.Itoa(binding.FixBatch),
-		"focused_tests: passed",
-	}, "\n"), 1)
+	envelope := remediationEnvelopeWithBinding(revision, binding)
 	payload := map[string]any{
 		"schema":                   "gentle-ai.remediation-evidence/v1",
 		"failed_evidence_revision": revision,
@@ -91,4 +197,35 @@ func remediationResultEvidenceWithBinding(revision string, binding RemediationBi
 	}
 	raw, _ := json.Marshal(payload)
 	return envelope + "\n```json\n" + string(raw) + "\n```"
+}
+
+func remediationEnvelopeWithBinding(revision string, binding RemediationBinding) string {
+	return strings.Replace(remediationEnvelope(revision), "focused_tests: passed", strings.Join([]string{
+		"lineage_id: " + binding.LineageID,
+		"generation: " + strconv.Itoa(binding.Generation),
+		"fix_batch: " + strconv.Itoa(binding.FixBatch),
+		"focused_tests: passed",
+	}, "\n"), 1)
+}
+
+func legacyRemediationResult(revision string, binding RemediationBinding) string {
+	return strings.Join([]string{
+		"```json",
+		"{",
+		"  \"schema\": \"gentle-ai.remediation-result/v1\",",
+		"  \"failedVerifyRevision\": \"" + revision + "\",",
+		"  \"lineageId\": \"" + binding.LineageID + "\",",
+		"  \"generation\": " + strconv.Itoa(binding.Generation) + ",",
+		"  \"fixBatch\": " + strconv.Itoa(binding.FixBatch),
+		"}",
+		"```",
+	}, "\n")
+}
+
+func quoteRemediationEnvelope(envelope, prefix string) string {
+	lines := strings.Split(envelope, "\n")
+	for index, line := range lines {
+		lines[index] = prefix + line
+	}
+	return strings.Join(lines, "\n")
 }
