@@ -155,7 +155,11 @@ func opencodePluginUpgrade(ctx context.Context, r update.UpdateResult) (string, 
 	default:
 	}
 
-	targets := []string{pkg + "@latest", "@opencode-ai/plugin@latest"}
+	expectedVersion := strings.TrimSpace(r.LatestVersion)
+	if expectedVersion == "" {
+		return "", &ManualFallbackError{Hint: fmt.Sprintf("OpenCode plugin %s upgrade cannot be pinned because the expected version is empty; rerun the update check and try again.", pkg)}
+	}
+	targets := []string{pkg + "@" + expectedVersion, "@opencode-ai/plugin@latest"}
 	var cmd *exec.Cmd
 	switch pm {
 	case "bun":
@@ -193,7 +197,7 @@ func opencodePluginUpgrade(ctx context.Context, r update.UpdateResult) (string, 
 	}
 
 	observedVersion, err := inspectOpenCodePluginVersion(opencodeDir, pkg)
-	if err != nil || observedVersion != strings.TrimSpace(r.LatestVersion) {
+	if err != nil || observedVersion != expectedVersion {
 		return "", &ManualFallbackError{Hint: openCodePluginVerificationHint(r, pkg, opencodeDir, observedVersion, err)}
 	}
 	return observedVersion, nil
