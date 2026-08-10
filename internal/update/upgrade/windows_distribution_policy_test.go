@@ -40,8 +40,8 @@ func TestGentleAIWindowsUpgradeFailsClosedToSourceInstall(t *testing.T) {
 			}
 			profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true, GoAvailable: true}
 
-			exitRequested, err := runStrategy(context.Background(), r, profile)
-			if exitRequested {
+			outcome, err := runStrategy(context.Background(), r, profile)
+			if outcome.exitRequested {
 				t.Fatal("Windows omission policy requested process exit")
 			}
 			hint, ok := AsManualFallback(err)

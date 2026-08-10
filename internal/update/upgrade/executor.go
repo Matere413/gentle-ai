@@ -633,7 +633,7 @@ func executeOne(ctx context.Context, r update.UpdateResult, profile system.Platf
 		base.NewVersion = ""
 	}
 
-	outcome, err := runStrategyWithOutcome(ctx, r, profile, preflightDestination...)
+	outcome, err := runStrategy(ctx, r, profile, preflightDestination...)
 	if err != nil {
 		// Distinguish manual fallback (informational skip) from real failures.
 		if hint, ok := AsManualFallback(err); ok {

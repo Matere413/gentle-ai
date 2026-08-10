@@ -593,7 +593,7 @@ func TestRunStrategyOpenCodePluginUpgradesMaterializedPackage(t *testing.T) {
 		return cmd
 	}
 
-	outcome, err := runStrategyWithOutcome(context.Background(), update.UpdateResult{
+	outcome, err := runStrategy(context.Background(), update.UpdateResult{
 		Tool: update.ToolInfo{
 			Name:          pkg,
 			InstallMethod: update.InstallOpenCodePlugin,
@@ -702,7 +702,7 @@ func TestRunStrategyOpenCodePluginRejectsUnverifiedMaterialization(t *testing.T)
 			}
 			execCommand = func(name string, args ...string) *exec.Cmd { return mockCmd("true") }
 
-			outcome, err := runStrategyWithOutcome(context.Background(), update.UpdateResult{
+			outcome, err := runStrategy(context.Background(), update.UpdateResult{
 				Tool: update.ToolInfo{
 					Name:          pkg,
 					InstallMethod: update.InstallOpenCodePlugin,
